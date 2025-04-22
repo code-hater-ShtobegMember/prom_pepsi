@@ -1,10 +1,19 @@
 # Import necessary libraries
+import math
+
 import numpy as np
+import matplotlib
+from scipy.spatial.transform import Rotation
+
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.animation as animation
 import traceback
 from matplotlib.widgets import Button
+from scipy.integrate import RK45
+
+
 # Removed scipy.differentiate import as it wasn't used
 
 # --- Quaternion Class (Mostly Unchanged) ---
@@ -112,7 +121,7 @@ class RigidBody:
     def __init__(self, obj_id, obj_type, pos, vel, quat, ang_vel, mass):
         self.id = obj_id # Unique identifier
         self.obj_type = obj_type # 'sphere', 'cylinder', etc.
-        self.pos = np.asarray(pos, dtype=float)
+        self.pos = np.asarray(pos, dtype=float) # This is the CM position
         self.vel = np.asarray(vel, dtype=float)
         self.quat = quat if isinstance(quat, Quaternion) else Quaternion(*quat)
         self.ang_vel = np.asarray(ang_vel, dtype=float) # World frame
@@ -159,6 +168,7 @@ class Ball(RigidBody):
     def __init__(self, obj_id, pos, vel, quat, ang_vel, radius, mass):
         super().__init__(obj_id, 'sphere', pos, vel, quat, ang_vel, mass)
         self.radius = float(radius)
+        self.height = float(radius) # Use radius as height for sphere bounding
         self._calculate_inertia()
         self.update_inv_inertia_world() # Recalculate with correct local inertia
 
@@ -180,17 +190,41 @@ class Ball(RigidBody):
 # --- Pin Class ---
 class Pin(RigidBody):
     def __init__(self, obj_id, pos, vel, quat, ang_vel, radius, height, mass):
+        # Note: pos here is the Center of Mass position, not the base position
         super().__init__(obj_id, 'cylinder', pos, vel, quat, ang_vel, mass)
         self.radius = float(radius)
         self.height = float(height)
-        self._calculate_inertia()
+        self._calculate_inertia() # Calculate inertia about the new CM
         self.update_inv_inertia_world() # Recalculate with correct local inertia
 
+        # Define local coordinates of the bottom and top caps relative to the CM
+        self.local_bottom_cap_z = -self.height / 3.0
+        self.local_top_cap_z = 2.0 * self.height / 3.0
+
+
     def _calculate_inertia(self):
+        """Calculates the inertia tensor about the center of mass (1/3 height from base)."""
         if self.mass > 0 and self.radius > 0 and self.height > 0:
-            Ixy = (1.0 / 12.0) * self.mass * (3 * self.radius**2 + self.height**2)
-            Iz = (1.0 / 2.0) * self.mass * self.radius**2
-            self.inertia_local = np.diag([Ixy, Ixy, Iz])
+            # Inertia about the geometric center (standard formula)
+            Ixy_geometric = (1.0 / 12.0) * self.mass * (3 * self.radius**2 + self.height**2)
+            Iz_geometric = (1.0 / 2.0) * self.mass * self.radius**2
+
+            # Distance from geometric center (1/2 height) to new CM (1/3 height)
+            # The vector from geometric center to new CM is [0, 0, 1/3*h - 1/2*h] = [0, 0, -1/6*h] in local frame
+            distance_sq = (self.height / 6.0)**2
+
+            # Apply Parallel Axis Theorem: I_new = I_old + m * (r^2 * I - r * r^T)
+            # For diagonal inertia tensor and displacement along z-axis [0, 0, dz]:
+            # Ixx_new = Ixx_old + m * dz^2
+            # Iyy_new = Iyy_old + m * dz^2
+            # Izz_new = Izz_old (axis of rotation is parallel to displacement)
+
+            Ixx_new = Ixy_geometric + self.mass * distance_sq
+            Iyy_new = Ixy_geometric + self.mass * distance_sq
+            Izz_new = Iz_geometric # Izz is unchanged
+
+            self.inertia_local = np.diag([Ixx_new, Iyy_new, Izz_new])
+
             try:
                 self.inv_inertia_local = np.linalg.inv(self.inertia_local)
             except np.linalg.LinAlgError:
@@ -201,14 +235,14 @@ class Pin(RigidBody):
              self.inv_inertia_local = np.eye(3) # Prevent issues
 
     def get_vertices(self, n_sides=12):
-        """ Calculates world coordinates of top and bottom cap vertices. """
+        """ Calculates world coordinates of top and bottom cap vertices relative to the CM. """
         R = self.quat.to_rotation_matrix()
         vertices = {'top': [], 'bottom': []}
         for i in range(n_sides):
             angle = 2 * np.pi * i / n_sides
-            # Local coordinates (relative to center of mass)
-            local_top = np.array([self.radius * np.cos(angle), self.radius * np.sin(angle), self.height / 2.0])
-            local_bottom = np.array([self.radius * np.cos(angle), self.radius * np.sin(angle), -self.height / 2.0])
+            # Local coordinates (relative to the NEW center of mass)
+            local_top = np.array([self.radius * np.cos(angle), self.radius * np.sin(angle), self.local_top_cap_z])
+            local_bottom = np.array([self.radius * np.cos(angle), self.radius * np.sin(angle), self.local_bottom_cap_z])
             # Convert to world coordinates
             vertices['top'].append(self.pos + R @ local_top)
             vertices['bottom'].append(self.pos + R @ local_bottom)
@@ -220,31 +254,35 @@ DT = 0.01
 NUM_FRAMES = 500 # Increased frames
 COLLISION_EPSILON = 0.6 # Slightly less bouncy
 GRAVITY = np.array([0.0, 0.0, -9.81])
-FLOOR_RESTITUTION = 0.3 # How much bounce off the floor
-FLOOR_FRICTION_COEFF = 0.5 # Coefficient of kinetic friction
-
+FLOOR_RESTITUTION = 0.5 # How much bounce off the floor
+FLOOR_FRICTION_COEFF = 0.35 # Coefficient of kinetic friction
+EARTH_RADIUS = 6371000 # Unused
+EARTH_MASS = 5.972168 * math.pow(10,24) # Unused
 is_paused = False
 
 # --- Initial States & Objects ---
 ball_1 = Ball(obj_id='ball_1',
-              pos=np.array([-1.5, 0.0, 0.109]), # Start touching floor
-              vel=np.array([6.0, 0.1, 0.0]),    # Faster initial speed
+              pos=np.array([-1.5, 0.0, 0.109]), # Start touching floor (CM at radius)
+              vel=np.array([5.0, 0.1, 0.0]),    # Faster initial speed
               quat=Quaternion.identity(),
               ang_vel=np.array([0.0, 0.0, 0.0]), # Maybe add initial spin later
               radius=0.109,
-              mass=5.0)
+              mass= 5.0)
 
 pins = []
 # Standard 10-pin setup (approximate positions relative to origin (0,0))
 # Distances are roughly: Row separation ~ sqrt(3)*PinDiam, Pin separation in row ~ 1.0*PinDiam
-pin_diam = 2 * 0.06 # Pin diameter
-row_sep = np.sqrt(3) * 0.5 * (pin_diam * 2.2) # sqrt(3)/2 * spacing
-pin_spacing = pin_diam * 1.1 # Spacing within a row
+pin_radius = 0.06
+pin_height = 0.38
+pin_diam = 2 * pin_radius
+row_sep = 0.3 # Adjusted spacing based on visual
+pin_spacing = 0.3 # Adjusted spacing based on visual
 
-pin_positions = [
+# Base positions of the pins
+pin_base_positions = [
     # Row 1
     np.array([0.0, 0.0, 0.0]), # Pin 1 (at origin for simplicity)
-    # Row 2
+    # # Row 2
     np.array([row_sep, pin_spacing / 2.0, 0.0]), # Pin 2
     np.array([row_sep, -pin_spacing / 2.0, 0.0]), # Pin 3
     # Row 3
@@ -258,16 +296,16 @@ pin_positions = [
     np.array([3 * row_sep, -pin_spacing * 1.5, 0.0]), # Pin 10
 ]
 
-for i, pos in enumerate(pin_positions):
-     # Adjust Z so bottom is at 0
-    initial_pin_pos = pos + np.array([0.0, 0.0, 0.38 / 2.0])
+for i, base_pos in enumerate(pin_base_positions):
+     # Adjust initial position so the CENTER OF MASS is at base_pos + [0, 0, height/3]
+    initial_pin_cm_pos = base_pos + np.array([0.0, 0.0, pin_height / 3.0])
     pins.append(Pin(obj_id=f'pin_{i+1}',
-                   pos=initial_pin_pos,
+                   pos=initial_pin_cm_pos, # This is the CM position
                    vel=np.array([0.0, 0.0, 0.0]),
                    quat=Quaternion.identity(),
                    ang_vel=np.array([0.0, 0.0, 0.0]),
-                   radius=0.06,
-                   height=0.38,
+                   radius=pin_radius,
+                   height=pin_height,
                    mass=1.5))
 
 # Combine all simulation objects
@@ -275,254 +313,201 @@ sim_objects = [ball_1] + pins
 
 # --- Physics Engine ---
 
-# Structure to hold derivatives for one object
-class Derivatives:
-    def __init__(self):
-        self.d_pos = np.zeros(3)
-        self.d_vel = np.zeros(3)
-        self.d_quat = np.zeros(4) # Store as list/array for calculations
-        self.d_ang_vel = np.zeros(3)
+# Structure to hold derivatives for one object (not strictly necessary with RK45 state vector)
+# class Derivatives:
+#     def __init__(self):
+#         self.d_pos = np.zeros(3)
+#         self.d_vel = np.zeros(3)
+#         self.d_quat = np.zeros(4) # Store as list/array for calculations
+#         self.d_ang_vel = np.zeros(3)
 
-def calculate_derivatives(obj):
-    """ Calculates time derivatives for a single RigidBody object. """
-    derivs = Derivatives()
-    derivs.d_pos = obj.vel
+def derivatives(t, y, mass, inv_inertia_world):
+    """Calculates the time derivatives for the RK45 solver."""
+    # Unpack state vector
+    # pos = y[0:3] # Position is not needed for calculating derivatives of vel, quat, ang_vel
+    vel = y[3:6]
+    quat_list = y[6:10] # Quat as list
+    ang_vel = y[10:13]
 
-    # --- Forces ---
-    # Gravity
-    force = GRAVITY * obj.mass
-    # Could add other forces here (drag, etc.)
+    # Convert quaternion list back to Quaternion object for operations
+    quat = Quaternion(*quat_list)
 
-    derivs.d_vel = force * obj.inv_mass
+    # Linear acceleration from forces
+    acc = GRAVITY # Only gravity in this case
 
-    # --- Torques ---
-    # Currently no external torques applied
-    torque = np.zeros(3)
+    # Angular acceleration from torques
+    torque = np.zeros(3) # No external torques initially
+    ang_acc = inv_inertia_world @ torque
 
-    # Angular acceleration = I_world^-1 * (torque - omega x (I_world * omega))
-    # The omega x (I * omega) term is important for non-spherical objects but often omitted in simpler engines.
-    # Let's omit it for now for simplicity, similar to the original code.
-    # Re-calculate world inertia just in case? Should be updated after quat change.
-    # obj.update_inv_inertia_world() # Might be redundant if RK4 updates it
-    derivs.d_ang_vel = obj.inv_inertia_world @ torque
+    # Derivative of quaternion (from angular velocity)
+    # dQ/dt = 0.5 * omega_quat * Q
+    # omega_quat = [0, wx, wy, wz]
+    omega_quat = Quaternion(0.0, *ang_vel)
+    d_quat_obj = omega_quat * quat * 0.5 # Result is a Quaternion
 
-    # Quaternion derivative: dQ/dt = 0.5 * Quaternion(0, omega) * Q
-    omega_q = Quaternion(0.0, *obj.ang_vel)
-    q_dot = omega_q * obj.quat * 0.5
-    derivs.d_quat = q_dot.to_list()
+    # Pack derivatives into a single vector
+    dy = np.zeros(13)
+    dy[0:3] = vel       # d(pos)/dt = vel
+    dy[3:6] = acc       # d(vel)/dt = acc
+    dy[6:10] = d_quat_obj.to_list() # d(quat)/dt
+    dy[10:13] = ang_acc # d(ang_vel)/dt
 
-    return derivs
+    return dy
 
 
-def rk4_step(obj, dt):
-    """ Performs a single RK4 step for one RigidBody object. """
-    # Store initial state
-    y0_pos = obj.pos.copy()
-    y0_vel = obj.vel.copy()
-    # Make sure y0_quat is a distinct Quaternion object for the start of the step
-    # If obj.quat is modified in place by normalize, this reference is fine.
-    y0_quat = obj.quat
-    y0_ang_vel = obj.ang_vel.copy()
 
-    # --- Calculate k1 ---
-    k1 = calculate_derivatives(obj)
-    # Convert d_quat list to NumPy array for element-wise operations
-    k1_d_quat_np = np.array(k1.d_quat)
+def pack_state(obj):
+    """Packs object state into a numpy vector."""
+    return np.concatenate([
+        obj.pos,
+        obj.vel,
+        obj.quat.to_list(),
+        obj.ang_vel
+    ])
 
-    # --- Calculate k2 state ---
-    # Create a temporary quaternion for intermediate state calculation
-    temp_quat_k2 = y0_quat + k1_d_quat_np * (dt / 2.0) # Uses Quaternion.__add__(np.array) overload
-    temp_quat_k2.normalize()
-    # Create a temporary object state for derivative calculation (or update obj temporarily)
-    obj_temp_k2 = RigidBody(obj.id, obj.obj_type, # Create a shallow copy or update temporarily
-                           y0_pos + k1.d_pos * (dt / 2.0),
-                           y0_vel + k1.d_vel * (dt / 2.0),
-                           temp_quat_k2, # Use normalized intermediate quat
-                           y0_ang_vel + k1.d_ang_vel * (dt / 2.0),
-                           obj.mass)
-    # Copy necessary attributes if needed (like inertia, radius etc.)
-    obj_temp_k2.inv_inertia_local = obj.inv_inertia_local # Need local inertia
-    obj_temp_k2.update_inv_inertia_world() # Update world based on temp orientation
-    k2 = calculate_derivatives(obj_temp_k2)
-    k2_d_quat_np = np.array(k2.d_quat)
+def rk45_step(obj, dt):
+    """Performs one RK45 integration step for a rigid body."""
+    y0 = pack_state(obj)
+    t0 = 0.0
+    t1 = dt
 
-    # --- Calculate k3 state ---
-    temp_quat_k3 = y0_quat + k2_d_quat_np * (dt / 2.0)
-    temp_quat_k3.normalize()
-    obj_temp_k3 = RigidBody(obj.id, obj.obj_type,
-                           y0_pos + k2.d_pos * (dt / 2.0),
-                           y0_vel + k2.d_vel * (dt / 2.0),
-                           temp_quat_k3,
-                           y0_ang_vel + k2.d_ang_vel * (dt / 2.0),
-                           obj.mass)
-    obj_temp_k3.inv_inertia_local = obj.inv_inertia_local
-    obj_temp_k3.update_inv_inertia_world()
-    k3 = calculate_derivatives(obj_temp_k3)
-    k3_d_quat_np = np.array(k3.d_quat)
+    # Pass mass and inverse inertia to the derivatives function
+    rk = RK45(
+        fun=lambda t, y: derivatives(t, y, obj.mass, obj.inv_inertia_world),
+        t0=t0,
+        y0=y0,
+        t_bound=t1,
+        max_step=dt # Allow RK45 to take steps up to dt
+    )
 
-    # --- Calculate k4 state ---
-    temp_quat_k4 = y0_quat + k3_d_quat_np * dt
-    temp_quat_k4.normalize()
-    obj_temp_k4 = RigidBody(obj.id, obj.obj_type,
-                           y0_pos + k3.d_pos * dt,
-                           y0_vel + k3.d_vel * dt,
-                           temp_quat_k4,
-                           y0_ang_vel + k3.d_ang_vel * dt,
-                           obj.mass)
-    obj_temp_k4.inv_inertia_local = obj.inv_inertia_local
-    obj_temp_k4.update_inv_inertia_world()
-    k4 = calculate_derivatives(obj_temp_k4)
-    k4_d_quat_np = np.array(k4.d_quat)
+    # Perform steps until t_bound (dt) is reached or exceeded
+    while rk.t < t1:
+        try:
+            rk.step()
+        except StopIteration:
+            # This happens when t_bound is reached exactly
+            break
 
-    # --- Combine and Update Object's Actual State ---
-    obj.pos = y0_pos + (dt / 6.0) * (k1.d_pos + 2*k2.d_pos + 2*k3.d_pos + k4.d_pos)
-    obj.vel = y0_vel + (dt / 6.0) * (k1.d_vel + 2*k2.d_vel + 2*k3.d_vel + k4.d_vel)
+    y_new = rk.y
 
-    # Quaternion update: Use weighted average of derivative numpy arrays
-    final_d_quat_np = (k1_d_quat_np + 2*k2_d_quat_np + 2*k3_d_quat_np + k4_d_quat_np) / 6.0
-    # Add the final scaled delta to the original quaternion
-    obj.quat = y0_quat + final_d_quat_np * dt
-    obj.quat.normalize() # Final normalization of the object's quaternion
-
-    obj.ang_vel = y0_ang_vel + (dt / 6.0) * (k1.d_ang_vel + 2*k2.d_ang_vel + 2*k3.d_ang_vel + k4.d_ang_vel)
-
-    # Final update of the object's world inertia tensor based on its new orientation
-    obj.update_inv_inertia_world()
+    # Unpack the new state into the object
+    obj.set_state_from_vector(y_new)
 
 
 def check_and_resolve_collision(obj1, obj2):
     """ Checks and resolves collisions between two RigidBody objects. """
-    # Currently only implements Ball-Pin collision
-    ball = None
-    pin = None
-    if isinstance(obj1, Ball) and isinstance(obj2, Pin):
-        ball = obj1
-        pin = obj2
-    elif isinstance(obj1, Pin) and isinstance(obj2, Ball):
-        ball = obj2
-        pin = obj1
-    elif isinstance(obj1, Pin) and isinstance(obj2, Pin):
-        # TODO: Implement Pin-Pin Collision (similar logic, but cylinder-cylinder)
-        return # Skip Pin-Pin for now
-    elif isinstance(obj1, Ball) and isinstance(obj2, Ball):
-        # TODO: Implement Ball-Ball Collision (sphere-sphere)
-        return # Skip Ball-Ball for now
-    else:
-        return # Unknown pair
+    obj2_pos, obj2_vel, obj2_q, obj2_ang_vel = obj2.pos, obj2.vel, obj2.quat, obj2.ang_vel
+    obj1_pos, obj1_vel, obj1_q, obj1_ang_vel = obj1.pos, obj1.vel, obj1.quat, obj1.ang_vel
 
-    # --- Use object properties directly ---
-    ball_pos, ball_vel, ball_q, ball_ang_vel = ball.pos, ball.vel, ball.quat, ball.ang_vel
-    pin_pos, pin_vel, pin_q, pin_ang_vel = pin.pos, pin.vel, pin.quat, pin.ang_vel
-
-    vec_pin_to_ball = ball_pos - pin_pos
-    dist_centers_sq = np.dot(vec_pin_to_ball, vec_pin_to_ball)
+    vec_obj1_to_obj2 = obj2_pos - obj1_pos
+    dist_centers_sq = np.dot(vec_obj1_to_obj2, vec_obj1_to_obj2)
 
     # Broad Phase
-    bounding_radius_pin = np.sqrt(pin.radius**2 + (pin.height / 2)**2)
-    min_dist_centers = ball.radius + bounding_radius_pin
-    if dist_centers_sq > min_dist_centers**2:
-        return # Too far apart
+    bounding_radius_obj1 = np.sqrt(obj1.radius ** 2 + (obj1.height / 2) ** 2)
+    min_dist_centers = obj2.radius + bounding_radius_obj1
+    if dist_centers_sq > min_dist_centers ** 2:
+        return  # Too far apart
 
     # Detailed Check
-    pin_z_axis_world = pin_q.rotate_vector([0, 0, 1])
-    pin_y_axis_world = pin_q.rotate_vector([0, 1, 0])
-    pin_x_axis_world = pin_q.rotate_vector([1, 0, 0])
+    obj1_z_axis_world = obj1_q.rotate_vector([0, 0, 1])
+    obj1_y_axis_world = obj1_q.rotate_vector([0, 1, 0])
+    obj1_x_axis_world = obj1_q.rotate_vector([1, 0, 0])
 
-    proj_len = np.dot(vec_pin_to_ball, pin_z_axis_world)
-    closest_pt_on_axis = pin_pos + proj_len * pin_z_axis_world
-    vec_axis_to_ball = ball_pos - closest_pt_on_axis
-    dist_axis_to_ball_sq = np.dot(vec_axis_to_ball, vec_axis_to_ball)
-    dist_axis_to_ball = np.sqrt(dist_axis_to_ball_sq) if dist_axis_to_ball_sq > 0 else 0
-
-    is_within_height_range = abs(proj_len) <= pin.height / 2.0
+    proj_len = np.dot(vec_obj1_to_obj2, obj1_z_axis_world)
+    closest_pt_on_axis = obj1_pos + proj_len * obj1_z_axis_world
+    vec_axis_to_obj2 = obj2_pos - closest_pt_on_axis
+    dist_axis_to_obj2_sq = np.dot(vec_axis_to_obj2, vec_axis_to_obj2)
+    dist_axis_to_obj2 = np.sqrt(dist_axis_to_obj2_sq) if dist_axis_to_obj2_sq > 0 else 0
+    is_within_height_range = abs(proj_len) <= obj1.height / 2.0
     # Use slightly tolerance for range check robustness
-    radial_thresh = pin.radius + ball.radius
-    is_within_radial_range = dist_axis_to_ball < radial_thresh + 1e-5
+    radial_thresh = obj1.radius + obj2.radius
+    is_within_radial_range = dist_axis_to_obj2 < radial_thresh + 1e-5
 
-    is_within_cap_height_range = pin.height / 2.0 < abs(proj_len) < pin.height / 2.0 + ball.radius + 1e-5
-    is_radially_inside_cap_proj = dist_axis_to_ball < pin.radius + 1e-5 # Ball center needs project inside pin radius
+    is_within_cap_height_range = obj1.height / 2.0 < abs(proj_len) < obj1.height / 2.0 + obj2.radius + 1e-5
+    is_radially_inside_cap_proj = dist_axis_to_obj2 < obj1.radius + 1e-5  # obj2 center needs to project inside obj1 radius
 
     collided = False
     penetration_depth = 0.0
     contact_normal = np.zeros(3)
-    contact_point_ball_local = np.zeros(3)
-    contact_point_pin_local = np.zeros(3)
-    contact_point_pin_world = np.zeros(3) # Store world point for calc
+    contact_point_obj2_local = np.zeros(3)
+    contact_point_obj1_local = np.zeros(3)
+    contact_point_obj1_world = np.zeros(3)  # Store world point for calc
 
     # Check Wall Collision
     if is_within_height_range and is_within_radial_range:
-        penetration_candidate = radial_thresh - dist_axis_to_ball
-        if penetration_candidate > -1e-5: # Allow very slight overlap before trigger
-            if dist_axis_to_ball > 1e-6:
-                contact_normal = vec_axis_to_ball / dist_axis_to_ball
-            else: # Ball center is on the pin axis - push radially
-                contact_normal = pin_x_axis_world if abs(np.dot(vec_pin_to_ball, pin_x_axis_world)) > abs(np.dot(vec_pin_to_ball, pin_y_axis_world)) else pin_y_axis_world
+        penetration_candidate = radial_thresh - dist_axis_to_obj2
+        if penetration_candidate > -1e-5:  # Allow very slight overlap before trigger
+            if dist_axis_to_obj2 > 1e-6:
+                contact_normal = vec_axis_to_obj2 / dist_axis_to_obj2
+            else:  # obj2 center is on the obj1 axis - push radially
+                contact_normal = obj1_x_axis_world if abs(np.dot(vec_obj1_to_obj2, obj1_x_axis_world)) > abs(
+                    np.dot(vec_obj1_to_obj2, obj1_y_axis_world)) else obj1_y_axis_world
 
-            penetration_depth = max(0, penetration_candidate) # Ensure non-negative
+            penetration_depth = max(0, penetration_candidate)  # Ensure non-negative
             collided = True
-            contact_point_ball_local = -contact_normal * ball.radius # Relative to ball center
-            contact_point_pin_world = closest_pt_on_axis + contact_normal * pin.radius # On pin surface
-            contact_point_pin_local = pin_q.conjugate().rotate_vector(contact_point_pin_world - pin_pos)
+            contact_point_obj2_local = -contact_normal * obj2.radius  # Relative to obj2 center
+            contact_point_obj1_world = closest_pt_on_axis + contact_normal * obj1.radius  # On obj1 surface
+            contact_point_obj1_local = obj1_q.conjugate().rotate_vector(contact_point_obj1_world - obj1_pos)
             # print(f"Wall Hit: depth={penetration_depth:.4f}")
 
     # Check Cap Collision (only if not already hit wall)
     # Use fixed cap contact point logic!
     if not collided and is_within_cap_height_range and is_radially_inside_cap_proj:
-        penetration_candidate = ball.radius - (abs(proj_len) - pin.height / 2.0)
+        penetration_candidate = obj2.radius - (abs(proj_len) - obj1.height / 2.0)
         if penetration_candidate > -1e-5:
             is_top_cap = proj_len > 0
-            contact_normal = pin_z_axis_world if is_top_cap else -pin_z_axis_world
+            contact_normal = obj1_z_axis_world if is_top_cap else -obj1_z_axis_world
             penetration_depth = max(0, penetration_candidate)
             collided = True
 
             # --- Corrected Cap Contact Point ---
-            cap_center_world = pin_pos + pin_z_axis_world * (pin.height / 2.0 * np.sign(proj_len))
-            # vec_axis_to_ball is the vector from axis to ball center (in cap plane)
-            contact_point_pin_world = cap_center_world + vec_axis_to_ball
+            cap_center_world = obj1_pos + obj1_z_axis_world * (obj1.height / 2.0 * np.sign(proj_len))
+            # vec_axis_to_obj2 is the vector from axis to obj2 center (in cap plane)
+            contact_point_obj1_world = cap_center_world + vec_axis_to_obj2
             # --- End Correction ---
 
-            contact_point_ball_local = -contact_normal * ball.radius
-            contact_point_pin_local = pin_q.conjugate().rotate_vector(contact_point_pin_world - pin_pos)
+            contact_point_obj2_local = -contact_normal * obj2.radius
+            contact_point_obj1_local = obj1_q.conjugate().rotate_vector(contact_point_obj1_world - obj1_pos)
             # print(f"Cap Hit: depth={penetration_depth:.4f}")
 
     if not collided or penetration_depth <= 0:
-        return # No actual collision/penetration
+        return  # No actual collision/penetration
 
     # --- Resolve Penetration (move objects apart based on mass) ---
-    total_mass = ball.mass + pin.mass
+    total_mass = obj2.mass + obj1.mass
     inv_total_mass = 1.0 / total_mass if total_mass > 1e-9 else 0
-    move_fraction_ball = pin.mass * inv_total_mass
-    move_fraction_pin = ball.mass * inv_total_mass
+    move_fraction_obj2 = obj1.mass * inv_total_mass
+    move_fraction_obj1 = obj2.mass * inv_total_mass
 
     # Correction factor slightly > 1 to ensure separation
     correction_factor = 1.01
     correction = contact_normal * penetration_depth * correction_factor
-    ball.pos += correction * move_fraction_ball
-    pin.pos -= correction * move_fraction_pin
+    obj2.pos += correction * move_fraction_obj2
+    obj1.pos -= correction * move_fraction_obj1
 
     # --- Calculate Impulse (velocity change) ---
-    r_ball_world = ball_q.rotate_vector(contact_point_ball_local) # Vector from ball CM to contact
-    r_pin_world = pin_q.rotate_vector(contact_point_pin_local)   # Vector from pin CM to contact
+    r_obj2_world = obj2_q.rotate_vector(contact_point_obj2_local)  # Vector from obj2 CM to contact
+    r_obj1_world = obj1_q.rotate_vector(contact_point_obj1_local)  # Vector from obj1 CM to contact
 
-    v_contact_ball = ball.vel + np.cross(ball.ang_vel, r_ball_world)
-    v_contact_pin = pin.vel + np.cross(pin.ang_vel, r_pin_world)
-    v_relative = v_contact_ball - v_contact_pin
+    v_contact_obj2 = obj2.vel + np.cross(obj2.ang_vel, r_obj2_world)
+    v_contact_obj1 = obj1.vel + np.cross(obj1.ang_vel, r_obj1_world)
+    v_relative = v_contact_obj2 - v_contact_obj1
     v_rel_normal = np.dot(v_relative, contact_normal)
 
     # If moving apart or resting, no impulse needed (vel already corrected by penetration push?)
-    if v_rel_normal >= -1e-4: # Small tolerance for resting contact separation
+    if v_rel_normal >= -1e-4:  # Small tolerance for resting contact separation
         return
 
     # Use already updated world inverse inertia tensors
-    inv_I_ball_world = ball.inv_inertia_world
-    inv_I_pin_world = pin.inv_inertia_world
+    inv_I_obj2_world = obj2.inv_inertia_world
+    inv_I_obj1_world = obj1.inv_inertia_world
 
     # Impulse calculation terms
-    term_ball_ang = np.cross(inv_I_ball_world @ np.cross(r_ball_world, contact_normal), r_ball_world)
-    term_pin_ang = np.cross(inv_I_pin_world @ np.cross(r_pin_world, contact_normal), r_pin_world)
-    ang_impulse_term = np.dot(term_ball_ang + term_pin_ang, contact_normal)
+    term_obj2_ang = np.cross(inv_I_obj2_world @ np.cross(r_obj2_world, contact_normal), r_obj2_world)
+    term_obj1_ang = np.cross(inv_I_obj1_world @ np.cross(r_obj1_world, contact_normal), r_obj1_world)
+    ang_impulse_term = np.dot(term_obj2_ang + term_obj1_ang, contact_normal)
 
-    impulse_denom = ball.inv_mass + pin.inv_mass + ang_impulse_term
+    impulse_denom = obj2.inv_mass + obj1.inv_mass + ang_impulse_term
 
     if abs(impulse_denom) < 1e-9:
         print("Warning: Impulse denominator near zero. Skipping impulse.")
@@ -532,75 +517,157 @@ def check_and_resolve_collision(obj1, obj2):
     impulse_vector = impulse_j * contact_normal
 
     # --- Apply Impulse ---
-    ball.vel += impulse_vector * ball.inv_mass
-    pin.vel -= impulse_vector * pin.inv_mass
+    obj2.vel += impulse_vector * obj2.inv_mass
+    obj1.vel -= impulse_vector * obj1.inv_mass
 
-    ball.ang_vel += inv_I_ball_world @ np.cross(r_ball_world, impulse_vector)
-    pin.ang_vel -= inv_I_pin_world @ np.cross(r_pin_world, impulse_vector)
+    obj2.ang_vel += inv_I_obj2_world @ np.cross(r_obj2_world, impulse_vector)
+    obj1.ang_vel -= inv_I_obj1_world @ np.cross(r_obj1_world, impulse_vector)
 
-    # print(f"Collision Resolved: j={impulse_j:.3f}")
+def get_lowest_point_on_cylinder_analytical(quat_wxyz, position, radius, height, local_bottom_cap_z, local_top_cap_z):
+    """
+    Finds the lowest point on either the top or bottom circle of a cylinder
+    in world space using an analytical approach, considering the CM is not
+    at the geometric center.
 
+    Args:
+        quat_wxyz (np.array or list): The orientation of the cylinder as a
+                                      quaternion in WXYZ format (scalar first).
+        position (np.array or list): The position of the cylinder's CENTER OF MASS
+                                in world space.
+        radius (float): The radius of the cylinder's circular caps.
+        height (float): The height of the cylinder. (Used for cap Z relative to CM)
+        local_bottom_cap_z (float): The local Z coordinate of the bottom cap center relative to the CM.
+        local_top_cap_z (float): The local Z coordinate of the top cap center relative to the CM.
+
+    Returns:
+        np.array: The world coordinates (x, y, z) of the lowest point on the
+                  cylinder's caps.
+    """
+    # Ensure inputs are numpy arrays for efficient operations
+    position = np.array(position)
+    quat_wxyz = np.array(quat_wxyz)
+
+    # Create a Rotation object from the quaternion (SciPy uses XYZW internally,
+    # so we convert WXYZ to XYZW)
+    quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
+    rotation = Rotation.from_quat(quat_xyzw)
+
+    # World down direction
+    world_down = np.array([0, 0, -1])
+
+    # Rotate the world down direction into the cylinder's local coordinate system
+    # This tells us which local direction corresponds to world down, relative to the CM.
+    local_down = rotation.inv().apply(world_down)
+
+    # The lowest point on a cap's circumference will be in the direction of
+    # the projection of the local_down vector onto the local XY plane (where
+    # the cap circles lie).
+    local_down_projected_xy = np.array([local_down[0], local_down[1], 0])
+
+    # Normalize the projected direction and scale by the radius.
+    # Handle the case where the projection is zero (cylinder axis is vertical).
+    norm_sq = np.sum(local_down_projected_xy**2)
+    if norm_sq == 0:
+        # Cylinder's local Z-axis is aligned with world Z-axis.
+        # The lowest point on the cap is just the center of the cap.
+        local_offset_radial = np.array([0, 0, 0])
+    else:
+        local_offset_direction = local_down_projected_xy / np.sqrt(norm_sq)
+        local_offset_radial = radius * local_offset_direction
+
+
+    # --- Calculate lowest point on the bottom cap ---
+    # Local center of the bottom cap relative to CM
+    bottom_cap_center_local_cm_origin = np.array([0, 0, local_bottom_cap_z])
+    # Local point on the circumference corresponding to world down, relative to CM
+    lowest_point_bottom_local_cm_origin = bottom_cap_center_local_cm_origin + local_offset_radial
+    # Convert to world space (relative to CM world position)
+    lowest_point_bottom_world = position + rotation.apply(lowest_point_bottom_local_cm_origin)
+
+    # --- Calculate lowest point on the top cap ---
+    # Local center of the top cap relative to CM
+    top_cap_center_local_cm_origin = np.array([0, 0, local_top_cap_z])
+    # Local point on the circumference corresponding to world down, relative to CM
+    lowest_point_top_local_cm_origin = top_cap_center_local_cm_origin + local_offset_radial
+    # Convert to world space (relative to CM world position)
+    lowest_point_top_world = position + rotation.apply(lowest_point_top_local_cm_origin)
+
+
+    # Compare the Z-coordinates in world space to find the overall lowest point
+    if lowest_point_bottom_world[2] < lowest_point_top_world[2]:
+        return lowest_point_bottom_world
+    else:
+        return lowest_point_top_world
 
 # --- Floor Collision (Improved) ---
 def resolve_floor_collisions(objects, dt):
     """Checks and resolves floor collisions for all objects in the list."""
-    contact_normal = np.array([0.0, 0.0, 1.0]) # Floor normal points up
+    contact_normal = np.array([0.0, 0.0, 1.0])  # Floor normal points up
 
     for obj in objects:
-        lowest_z = float('inf')
-        contact_points_world = [] # Potential points below floor
+        lowest_z_world = float('inf')
+        contact_points_world = []
 
         # --- 1. Find Lowest Point(s) and Penetration ---
         if isinstance(obj, Ball):
             lowest_z_candidate = obj.pos[2] - obj.radius
-            if lowest_z_candidate < lowest_z:
-                lowest_z = lowest_z_candidate
-            if lowest_z < 1e-5: # Tolerance
-                # Contact point is directly below the center for sphere
+            if lowest_z_candidate < lowest_z_world:
+                lowest_z_world = lowest_z_candidate
+            if lowest_z_world < 1e-5:  # Tolerance
+                # Contact point is directly below the CM for sphere
                 contact_points_world.append(obj.pos - contact_normal * obj.radius)
 
         elif isinstance(obj, Pin):
-            # Check vertices of the bottom cap
-            pin_vertices = obj.get_vertices() # Get {'top':[], 'bottom':[]}
-            for v_world in pin_vertices['bottom']:
-                if v_world[2] < lowest_z:
-                    lowest_z = v_world[2]
-                if v_world[2] < 1e-5: # Tolerance
-                    contact_points_world.append(v_world)
-             # If no vertices below, check bottom center (important if perfectly flat)
-            if not contact_points_world and lowest_z == float('inf'):
-                 R = obj.quat.to_rotation_matrix()
-                 local_center_bottom = np.array([0,0, -obj.height/2.0])
-                 world_center_bottom = obj.pos + R @ local_center_bottom
-                 if world_center_bottom[2] < 1e-5:
-                     lowest_z = world_center_bottom[2]
-                     contact_points_world.append(world_center_bottom)
+            # Use the helper function to find the lowest point on the pin's caps
+            q = np.array(obj.quat.to_list())
+            lowest_point = get_lowest_point_on_cylinder_analytical(
+                quat_wxyz= q,
+                position=obj.pos, # This is the CM position
+                radius=obj.radius,
+                height=obj.height,
+                local_bottom_cap_z=obj.local_bottom_cap_z, # Pass new local Zs
+                local_top_cap_z=obj.local_top_cap_z # Pass new local Zs
+            )
 
+            lowest_z_world = lowest_point[2]
+            if lowest_z_world < 1e-5: # Tolerance
+                 contact_points_world.append(lowest_point)
 
-        if not contact_points_world or lowest_z >= -1e-5: # No penetration
+        if not contact_points_world or lowest_z_world >= -1e-5:  # No actual penetration below floor level
             continue
 
-        # Average contact point if multiple vertices are penetrating (e.g., pin base flat)
-        # Ensure it's computed *each time* penetration occurs
+        # Average contact point if multiple vertices are penetrating (still valid for Ball)
         avg_contact_point_world = np.mean(contact_points_world, axis=0)
-        penetration_depth = -lowest_z # Since lowest_z is negative
+        # Penetration depth is the negative of the lowest Z world coordinate
+        penetration_depth = max(0, -lowest_z_world) # Ensure non-negative
 
         # --- 2. Resolve Penetration ---
+        # Move object up by the penetration depth along the floor normal
         # Ensure we don't overcorrect if already slightly above due to previous steps
-        actual_penetration = max(0, penetration_depth)
-        correction = contact_normal * actual_penetration * 1.05 # Move slightly more
+        correction_factor = 1.01 # Move slightly more to ensure separation
+        correction = contact_normal * penetration_depth * correction_factor
         obj.pos += correction
-        # Clamp Z position just in case (prevents sinking through floor over time)
+
+        # After moving the CM, the lowest point of the object should be at or above the floor.
+        # Clamp the Z position as a failsafe against sinking.
         if isinstance(obj, Ball):
-             if obj.pos[2] < obj.radius: obj.pos[2] = obj.radius
+             # Lowest point is CM.z - radius
+             if obj.pos[2] - obj.radius < -1e-6: # Still penetrating slightly?
+                 obj.pos[2] = obj.radius # Place CM so lowest point is at Z=0
         elif isinstance(obj, Pin):
-            # Recheck lowest point after move - should be >= 0
-             min_z_after = float('inf')
-             pin_vertices_after = obj.get_vertices()
-             for v_world in pin_vertices_after['bottom']:
-                  min_z_after = min(min_z_after, v_world[2])
-             if min_z_after < -1e-6: # Still somehow penetrating? Force slightly above.
-                 obj.pos[2] += abs(min_z_after) + 1e-4
+            # Recheck lowest point Z after correction
+             q = np.array(obj.quat.to_list())
+             current_lowest_point = get_lowest_point_on_cylinder_analytical(
+                 quat_wxyz= q,
+                 position=obj.pos, # Use updated CM position
+                 radius=obj.radius,
+                 height=obj.height,
+                 local_bottom_cap_z=obj.local_bottom_cap_z,
+                 local_top_cap_z=obj.local_top_cap_z
+             )
+             if current_lowest_point[2] < -1e-6: # Still penetrating slightly?
+                 # Move CM up by the remaining penetration
+                 obj.pos[2] += abs(current_lowest_point[2]) + 1e-4
                  # print(f"Warning: Floor penetration clamp needed for {obj.id}")
 
 
@@ -608,14 +675,15 @@ def resolve_floor_collisions(objects, dt):
         r_world = avg_contact_point_world - obj.pos # Vector from CM to avg contact point
 
         v_contact = obj.vel + np.cross(obj.ang_vel, r_world)
-        v_rel_normal = v_contact[2] # Z-component relative to static floor
+        v_rel_normal = np.dot(v_contact, contact_normal) # Z-component relative to static floor
 
         impulse_j_normal = 0.0 # Initialize
 
         # Only apply bounce impulse if approaching floor significantly
-        if v_rel_normal < -1e-3:
+        if v_rel_normal < -1e-3: # Velocity towards the floor
             # Use object's world inverse inertia tensor
             inv_I_world = obj.inv_inertia_world
+            # Calculate the angular component of the impulse denominator
             term_ang = np.cross(inv_I_world @ np.cross(r_world, contact_normal), r_world)
             ang_impulse_term = np.dot(term_ang, contact_normal)
             impulse_denom = obj.inv_mass + ang_impulse_term
@@ -632,21 +700,30 @@ def resolve_floor_collisions(objects, dt):
         # --- 4. Calculate Friction Impulse (Rotation/Slowing) ---
         # Recalculate contact velocity *after* bounce impulse
         v_contact = obj.vel + np.cross(obj.ang_vel, r_world)
-        v_tangential = v_contact.copy()
-        v_tangential[2] = 0.0 # Project onto XY plane (tangent to floor)
+        v_tangential = v_contact - np.dot(v_contact, contact_normal) * contact_normal # Velocity component parallel to floor
         speed_tangential = np.linalg.norm(v_tangential)
 
-        # Apply friction only if moving tangentially and there's contact force
-        # Approximation: Significant normal impulse OR penetration occurred (resting/sliding)
+        # Apply friction only if moving tangentially and there's contact force (either from gravity while resting/sliding or from bounce impulse)
         min_tangential_speed = 1e-3
-        # Need a measure of normal force for friction: F_f <= mu * F_n
-        # Rough approximation: Use normal impulse magnitude (if any) OR force needed to counteract gravity if penetrating/resting.
-        # Let's use a simplified approach: Apply max friction if contact occurred and moving tangentially.
-        if speed_tangential > min_tangential_speed and (impulse_j_normal > 1e-6 or actual_penetration > 1e-6) :
+        # Estimate Normal Force (N): Sum of force to counteract gravity and force from normal impulse
+        normal_force_magnitude = abs(obj.mass * GRAVITY[2]) # Magnitude of force of gravity in Z
+        # If there was a significant normal impulse, it implies a strong normal force
+        if impulse_j_normal > 1e-6:
+             # The force corresponding to the impulse over the timestep is Impulse / dt
+             # This is a simplification; a more rigorous approach would consider forces integrated over time.
+             # However, for a discrete-time simulation with instantaneous impulse, this is often used.
+             normal_force_magnitude += impulse_j_normal / DT # Add the 'impact force' part
+
+        # Calculate the maximum friction impulse magnitude based on Coulomb friction (mu * N * dt)
+        # This is the maximum impulse that friction can apply over *this timestep*
+        j_friction_max = FLOOR_FRICTION_COEFF * normal_force_magnitude * DT
+
+        # Calculate the impulse magnitude needed to stop tangential motion in this step
+        # The denominator is similar to the normal impulse denominator, but with the tangential direction
+        if speed_tangential > min_tangential_speed and normal_force_magnitude > 1e-6: # Need tangential speed and contact force
              friction_dir = -v_tangential / speed_tangential # Opposite to tangential velocity
              inv_I_world = obj.inv_inertia_world
 
-             # Calculate impulse needed to stop tangential motion in this step
              term_ang_friction = np.cross(inv_I_world @ np.cross(r_world, friction_dir), r_world)
              ang_friction_term = np.dot(term_ang_friction, friction_dir)
              friction_denom = obj.inv_mass + ang_friction_term
@@ -654,14 +731,6 @@ def resolve_floor_collisions(objects, dt):
              if abs(friction_denom) > 1e-9:
                   # Impulse magnitude needed to stop tangential motion
                   j_to_stop = speed_tangential / friction_denom
-
-                  # Max friction impulse magnitude based on Coulomb friction (mu * N)
-                  # Estimate Normal Force (N): Use gravity component + bounce impulse force
-                  normal_force_magnitude = abs(obj.mass * GRAVITY[2]) # Force due to gravity
-                  if impulse_j_normal > 0:
-                      normal_force_magnitude += impulse_j_normal / dt # Add force from bounce impulse
-
-                  j_friction_max = FLOOR_FRICTION_COEFF * normal_force_magnitude * dt # Max impulse over dt
 
                   # Actual friction impulse is the smaller of the two (cannot exceed max, cannot overcorrect velocity)
                   impulse_j_friction = min(j_to_stop, j_friction_max)
@@ -671,7 +740,6 @@ def resolve_floor_collisions(objects, dt):
                   # Apply friction impulse
                   obj.vel += impulse_vector_friction * obj.inv_mass
                   obj.ang_vel += inv_I_world @ np.cross(r_world, impulse_vector_friction)
-
 
 
 # --- Visualization ---
@@ -685,17 +753,20 @@ x_sph_unit = np.cos(u_sph) * np.sin(v_sph)
 y_sph_unit = np.sin(u_sph) * np.sin(v_sph)
 z_sph_unit = np.cos(v_sph)
 
-# Pre-calculate unit cylinder mesh points
+# Pre-calculate unit cylinder mesh points (relative to geometric center 0,0,0)
+# These will be transformed based on the Pin's CM and height relative to CM for rendering
 theta_cyl = np.linspace(0, 2 * np.pi, 20) # Reduced sides for performance
-z_cyl_unit = np.linspace(-0.5, 0.5, 8)
-theta_cyl_grid, z_cyl_grid_unit = np.meshgrid(theta_cyl, z_cyl_unit)
+z_cyl_unit_geom = np.linspace(-0.5, 0.5, 8) # Unit Z for cylinder wall mesh
+theta_cyl_grid, z_cyl_grid_unit_geom = np.meshgrid(theta_cyl, z_cyl_unit_geom)
 x_cyl_unit = np.cos(theta_cyl_grid)
 y_cyl_unit = np.sin(theta_cyl_grid)
-# Caps
-r_cap = np.linspace(0, 1, 5)
-theta_cap_grid, r_cap_grid = np.meshgrid(theta_cyl, r_cap) # Reuse theta_cyl
-x_cap_unit = r_cap_grid * np.cos(theta_cap_grid)
-y_cap_unit = r_cap_grid * np.sin(theta_cap_grid)
+
+# Caps (unit radius, unit Z at +/- 0.5 relative to geometric center)
+r_cap_unit = np.linspace(0, 1, 5)
+theta_cap_grid, r_cap_grid_unit = np.meshgrid(theta_cyl, r_cap_unit) # Reuse theta_cyl
+x_cap_unit = r_cap_grid_unit * np.cos(theta_cap_grid)
+y_cap_unit = r_cap_grid_unit * np.sin(theta_cap_grid)
+
 
 # Dictionary to store plot artists for updating efficiently
 plot_artists = {}
@@ -706,12 +777,12 @@ def init_visualization():
     plot_artists = {} # Clear existing artists
 
     # Draw Ground Plane Static
-    plot_limit_x = 4.0 # Increased range for 10 pins
-    plot_limit_y = 1.5
+    plot_limit_x = 2.0 # Increased range for 10 pins
+    plot_limit_y = 1.0
     plot_limit_z = 1.0
     ax.set_xlim(-1.5, plot_limit_x) # Start behind ball
     ax.set_ylim(-plot_limit_y, plot_limit_y)
-    ax.set_zlim(0, plot_limit_z)
+    ax.set_zlim(0, plot_limit_z) # Ensure Z starts from 0 (floor)
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
@@ -723,6 +794,7 @@ def init_visualization():
     for obj in sim_objects:
         if isinstance(obj, Ball):
             # Create ball surface plot
+            # Initial position is already the CM
             surf = ax.plot_surface(x_sph_unit * obj.radius + obj.pos[0],
                                    y_sph_unit * obj.radius + obj.pos[1],
                                    z_sph_unit * obj.radius + obj.pos[2],
@@ -730,35 +802,43 @@ def init_visualization():
             plot_artists[obj.id] = {'type': 'sphere', 'surface': surf}
         elif isinstance(obj, Pin):
             # Create pin surfaces (wall, top cap, bottom cap)
-            wall_surf = ax.plot_surface(np.zeros_like(x_cyl_unit), np.zeros_like(y_cyl_unit), np.zeros_like(z_cyl_grid_unit), color='red', alpha=0.7)
+            # Initial positions and orientations will be updated in update_visualization
+            wall_surf = ax.plot_surface(np.zeros_like(x_cyl_unit), np.zeros_like(y_cyl_unit), np.zeros_like(z_cyl_grid_unit_geom), color='red', alpha=0.7)
             top_cap_surf = ax.plot_surface(np.zeros_like(x_cap_unit), np.zeros_like(y_cap_unit), np.zeros_like(x_cap_unit), color='white', alpha=0.8)
             bottom_cap_surf = ax.plot_surface(np.zeros_like(x_cap_unit), np.zeros_like(y_cap_unit), np.zeros_like(x_cap_unit), color='darkred', alpha=0.8)
             plot_artists[obj.id] = {'type': 'cylinder', 'wall': wall_surf, 'top': top_cap_surf, 'bottom': bottom_cap_surf}
 
-    return list(plot_artists.keys()) # Return IDs perhaps? Or all artists flatten?
+    # Return a list of all artists that will be updated
+    # This is not strictly necessary for blit=False, but good practice
+    all_artists = []
+    for obj_id, artists in plot_artists.items():
+        if artists['type'] == 'sphere':
+            all_artists.append(artists['surface'])
+        elif artists['type'] == 'cylinder':
+            all_artists.extend([artists['wall'], artists['top'], artists['bottom']])
+    return all_artists
 
 
 def update_visualization(frame):
     """Updates the positions and orientations of plot artists."""
     ax.set_title(f'Bowling Simulation (Frame {frame}) DT={DT:.3f}')
 
-    artists_to_return = []
+    artists_to_return = [] # List to hold artists that have been updated
 
     for obj in sim_objects:
         obj_artists = plot_artists.get(obj.id)
         if not obj_artists: continue
 
-        rot_matrix = obj.quat.to_rotation_matrix()
+        rot_matrix = obj.quat.to_rotation_matrix() # Rotation matrix from CM
 
         if obj_artists['type'] == 'sphere':
             surf = obj_artists['surface']
-            # Calculate new coordinates
+            # Calculate new coordinates relative to CM
             x_new = x_sph_unit * obj.radius + obj.pos[0]
             y_new = y_sph_unit * obj.radius + obj.pos[1]
             z_new = z_sph_unit * obj.radius + obj.pos[2]
-            # Update surface data - requires segments
-            verts = [list(zip(x_new.flatten(), y_new.flatten(), z_new.flatten()))]
-            # Recreate the Poly3DCollection - inefficient but often necessary
+
+            # Update surface data - Requires removing and re-adding surface for simplicity with matplotlib 3D
             surf.remove()
             new_surf = ax.plot_surface(x_new, y_new, z_new, color='darkblue', alpha=0.9)
             plot_artists[obj.id]['surface'] = new_surf # Store new artist
@@ -766,36 +846,41 @@ def update_visualization(frame):
 
 
         elif obj_artists['type'] == 'cylinder':
-            # Transform unit cylinder points to world space
-            # Wall
+            # Transform unit cylinder points to world space, relative to the CM (obj.pos)
+            # Wall: Unit Z (-0.5 to 0.5) needs to map to local Z (-h/3 to 2h/3)
+            # Mapping: local_z = (unit_z + 0.5) * height - height/3.0
+            # local_z = unit_z * height + 0.5 * height - height/3.0
+            # local_z = unit_z * height + height/6.0
+            local_cyl_z_coords = z_cyl_grid_unit_geom * obj.height + obj.height/6.0
+
             cyl_points_local = np.vstack([
                 (obj.radius * x_cyl_unit).flatten(),
                 (obj.radius * y_cyl_unit).flatten(),
-                (obj.height * z_cyl_grid_unit).flatten()
+                local_cyl_z_coords.flatten() # Use adjusted local Z
             ])
-            cyl_points_world = rot_matrix @ cyl_points_local + obj.pos[:, np.newaxis]
+            cyl_points_world = rot_matrix @ cyl_points_local + obj.pos[:, np.newaxis] # Transform from CM
             x_cyl = cyl_points_world[0, :].reshape(x_cyl_unit.shape)
             y_cyl = cyl_points_world[1, :].reshape(y_cyl_unit.shape)
-            z_cyl = cyl_points_world[2, :].reshape(z_cyl_grid_unit.shape)
+            z_cyl = cyl_points_world[2, :].reshape(local_cyl_z_coords.shape)
 
-            # Top Cap
+            # Top Cap: Local Z = 2h/3 relative to CM
             cap_top_points_local = np.vstack([
                 (obj.radius * x_cap_unit).flatten(),
                 (obj.radius * y_cap_unit).flatten(),
-                np.full(x_cap_unit.size, obj.height * 0.5)
+                np.full(x_cap_unit.size, obj.local_top_cap_z) # Use stored local Z
             ])
-            cap_top_points_world = rot_matrix @ cap_top_points_local + obj.pos[:, np.newaxis]
+            cap_top_points_world = rot_matrix @ cap_top_points_local + obj.pos[:, np.newaxis] # Transform from CM
             x_cap_top = cap_top_points_world[0, :].reshape(x_cap_unit.shape)
             y_cap_top = cap_top_points_world[1, :].reshape(y_cap_unit.shape)
             z_cap_top = cap_top_points_world[2, :].reshape(x_cap_unit.shape)
 
-            # Bottom Cap
+            # Bottom Cap: Local Z = -h/3 relative to CM
             cap_bottom_points_local = np.vstack([
                 (obj.radius * x_cap_unit).flatten(),
                 (obj.radius * y_cap_unit).flatten(),
-                np.full(x_cap_unit.size, -obj.height * 0.5)
+                np.full(x_cap_unit.size, obj.local_bottom_cap_z) # Use stored local Z
             ])
-            cap_bottom_points_world = rot_matrix @ cap_bottom_points_local + obj.pos[:, np.newaxis]
+            cap_bottom_points_world = rot_matrix @ cap_bottom_points_local + obj.pos[:, np.newaxis] # Transform from CM
             x_cap_bottom = cap_bottom_points_world[0, :].reshape(x_cap_unit.shape)
             y_cap_bottom = cap_bottom_points_world[1, :].reshape(y_cap_unit.shape)
             z_cap_bottom = cap_bottom_points_world[2, :].reshape(x_cap_unit.shape)
@@ -837,19 +922,19 @@ btn_play.on_clicked(play)
 # --- Main Simulation Loop (Update Function for Animation) ---
 def update(frame):
     """Updates the animation frame"""
-    # Declare that we are using the global variables sim_objects and is_paused
-    global sim_objects, is_paused, ani # Add ani here as well for error handling
-
-    if is_paused:
-        # Need to return the artists for the animation to stay visible
-        # When blit=False, returning the axes object is usually sufficient and safer.
-        return ax,
+    # # Declare that we are using the global variables sim_objects and is_paused
+    # global sim_objects, is_paused, ani # Add ani here as well for error handling
+    #
+    # if is_paused:
+    #     # Need to return the artists for the animation to stay visible
+    #     # When blit=False, returning the axes object is usually sufficient and safer.
+    #     return ax,
 
     try:
         # --- Physics Steps ---
         # 1. Integrate motion for all objects
         for obj in sim_objects:
-            rk4_step(obj, DT)
+            rk45_step(obj, DT)
 
         # --- Collision Handling ---
         # 2. Check and resolve floor collisions first (stable base)
@@ -863,14 +948,15 @@ def update(frame):
                 check_and_resolve_collision(obj1, obj2) # Modifies objects in place
 
         # --- Update Visualization ---
+
         return update_visualization(frame) # Call separate viz update
 
     except Exception as e:
         print(f"Error in frame {frame}:")
         traceback.print_exc()
         # Stop animation on error
-        if ani and hasattr(ani, 'event_source') and ani.event_source:
-            # Check if event source exists before trying to stop
+        if 'ani' in globals() and ani and hasattr(ani, 'event_source') and ani.event_source:
+            # Check if ani is defined and has event_source before trying to stop
              try:
                  ani.event_source.stop()
                  print("Animation stopped due to error.")
